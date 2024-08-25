@@ -11,7 +11,7 @@ from collections import Counter
 from io import StringIO, BytesIO
 from urllib.request import urlopen, Request
 from zipfile import ZipFile
-
+import pandas as pd
 import bs4
 import langid
 import pdf2image
@@ -26,15 +26,24 @@ from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfparser import PDFParser
 from requests_ip_rotator import ApiGateway
-
+from datastore import load, dump, finished_url, problem_url, store_data, append_to_aws, load_from_aws
 import uuid
-
+already_on_s3 = "processed_items3.pickle"
+already_scraped = "already_scraped3.pickle"
 uid = uuid.uuid4()
-
-
+import boto3
+import json
+from datetime import date
+from ocr import url_to_text
 finished = f'finished_{uid}.pickle'
 problem = f'problem_{uid}.pickle'
 results = f'results_{uid}.pickle'
+
+import logging
+logging.basicConfig(filename='scraper.log', encoding='utf-8', level=logging.DEBUG)
+
+
+
 # http_client.HTTPConnection.debuglevel = 1
 logging.basicConfig()
 logging.getLogger().setLevel(logging.WARNING)
@@ -70,7 +79,7 @@ def extract_text_from_pdf_url(url):
 
     request = Request(url)
     response = urlopen(request).read()
-    print(f"Got response {response}")
+    logging.debug(f"Got response {response}")
     fb = BytesIO(response)
 
     page_interpreter = PDFPageInterpreter(resource_manager, converter)
@@ -99,20 +108,31 @@ def extract_text_from_pdf_url(url):
 
 
 def text_from_url(u, second=1):
-    print("waiting")
+    logging.debug("waiting")
     if not u:
         return ""
     loader = MyPDFLoader(u)
     try:
         data = loader.load()
-        print(f"Got text {data[0]}")
+        logging.debug(f"Got text {data[0]}")
         return data[0]
     except Exception as e:
-        print(e)
+        logging.debug(e)
         if second > 3:
             return ""
         time.sleep(5 + second * 3)
         return text_from_url(u, second=second + 1)
+
+
+
+def text_from_url2(u):
+    loader = MyPDFLoader(u)
+    try:
+        data = loader.load()
+        logging.debug(f"Got text {data[0]}")
+        return data[0]
+    except Exception as e:
+        logging.debug(e)
 
 
 def images_to_txt(path, language):
@@ -224,13 +244,13 @@ def extract_books_data(url):
         # Add the file size to the total data size
         total_data_size += int(file_size)
 
-        # Print the title and file size
-        print('Title:', title)
-        print('File Size:', file_size)
-        print('---')
+        # logging.debug the title and file size
+        logging.debug('Title:', title)
+        logging.debug('File Size:', file_size)
+        logging.debug('---')
 
-    # Print the total data size
-    print('Total Data Size (bytes):', total_data_size)
+    # logging.debug the total data size
+    logging.debug('Total Data Size (bytes):', total_data_size)
 
 
 # URL of the website
@@ -243,7 +263,7 @@ def get_page(num):
 
 
 def all_pages():
-    for i in range(0, 2011):
+    for i in range(198, 2011): # last was 198
         yield get_page(i)
 
 
@@ -309,7 +329,7 @@ def get_keywords(u):
         soup = BeautifulSoup(html_content, 'html.parser')
         return parse_keywords(soup)
     except Exception as e:
-        print(e)
+        logging.debug(e)
         return []
 
 
@@ -317,10 +337,33 @@ def test_keywords():
     assert os.path.isfile('keyword.html')
     with open('keyword.html') as d:
         soup = BeautifulSoup(d.read(), 'html.parser')
-    print(soup)
+    logging.debug(soup)
     keywords = parse_keywords(soup)
-    print(keywords)
+    logging.debug(keywords)
     return keywords
+
+
+def try_with_default(default, fun, fun_param):
+    try:
+        return fun(fun_param)
+    except Exception as e:
+        logging.debug(e)
+        return default
+
+def marked_scraped(data):
+    store_data(data['title'], results=already_scraped, unique=True)
+
+def mark_ons3(data):
+    store_data(data['title'], results=already_on_s3, unique=True)
+
+def check_on_s3(data):
+    items = load(already_on_s3)
+    return data['title'] in items
+def check_scraped(data):
+    items = load(already_scraped)
+    return data['title'] in items
+
+
 
 
 def scrape_table(table):
@@ -333,22 +376,23 @@ def scrape_table(table):
         columns = [i.text for i in columns]
         assert len(columns) == len(column_names)
         data = dict(zip(column_names, columns))
-        data['link'] = link
-        data['size'] = clean_file_size(data['size'])
-        try:
-            data['lang'] = langid.classify(data['title'])[0]
-        except Exception as e:
-            data['lang'] = '?'
-            print(e)
-        data['download_url'] = book_url_to_download_url(data['link'])
-        data['keywords'] = get_keywords(data['link'])
-        if data['lang'] in ['en', '?', '', ' '] or not data['lang']:
+
+        if not check_scraped(data):
+            marked_scraped(data)
+            data['link'] = link
+            data['size'] = clean_file_size(data['size'])
             try:
-                data['document'] = text_from_url(data['download_url'])
-                time.sleep(2)
-            except:
-                data['document'] = None
-        table.append(data)
+                data['lang'] = langid.classify(data['title'])[0]
+            except Exception as e:
+                data['lang'] = '?'
+                logging.debug(e)
+
+            data['download_url'] = book_url_to_download_url(data['link'])
+            data['keywords'] = try_with_default([], get_keywords, data['link'])
+            table.append(data)
+        else:
+            logging.debug(f"Skipping {data['title']}")
+
     return table
 
 
@@ -356,42 +400,6 @@ def get_container(soup):
     div = soup.find('div', id='right_inner')
     if div:
         return div.find('div', class_='margin')
-
-
-def load(w):
-    if not os.path.isfile(w):
-        data = []
-    else:
-        with open(w, 'rb') as f:
-            data = pickle.load(f)
-    print(f"{w} has {len(data)} items...")
-    return data
-
-
-def dump(w, data=None):
-    with open(w, 'wb') as f:
-        pickle.dump(data, f)
-
-
-def finished_url(u):
-    p = load(finished)
-    p.append(u)
-    dump(finished, p)
-
-
-def problem_url(u):
-    p = load(problem)
-    p.append(u)
-    dump(problem, p)
-
-
-def store_data(data, replace=False):
-    if replace:
-        dump(results, data)
-        return
-    p = load(results)
-    p.append(data)
-    dump(results, p)
 
 
 def scrape_page(current_url):
@@ -406,7 +414,7 @@ def scrape_page(current_url):
                 finished_url(current_url)
                 return data
             except Exception as e:
-                print(e)
+                logging.debug(e)
     problem_url(current_url)
 
 
@@ -455,8 +463,8 @@ def get_book_data(url):
 def test_clean_file():
     t = "(32.657.206 B)"
     t2 = " (887.837 B)"
-    print(clean_file_size(t))
-    print(clean_file_size(t2))
+    logging.debug(clean_file_size(t))
+    logging.debug(clean_file_size(t2))
 
 
 def calculate_library_size(books):
@@ -481,10 +489,27 @@ def calculate_library_size(books):
 
 def get_everything():
     for page in all_pages():
-        print(f"Scraping {page}")
+        logging.debug(f"Scraping {page}")
         data = scrape_page(page)
-        store_data(data)
-        time.sleep(1)
+        if data:
+            store_data(data, results=results)
+            logging.debug("done")
+
+        else:
+            logging.debug("no data")
+
+
+
+
+def step_2(data_name):
+    data = load(data_name)
+    data = flatten(data)
+    for item in data:
+        if isinstance(item['lang'], tuple):
+            item['lang'] = item['lang'][0]
+
+
+
 
 
 # Define the starting URL
@@ -493,10 +518,10 @@ starting_url = 'http://english.grimoar.cz/?Loc=key&Lng=2'
 
 def get_langs_from_data():
     data = load(results)
-    print(f"Data is {len(data)} items \n type: {type(data)} {type(data[0])} {len(data[0])}")
+    logging.debug(f"Data is {len(data)} items \n type: {type(data)} {type(data[0])} {len(data[0])}")
     # sizes = [int(i['size'])[:-1] for i in data]
-    # print(f"{sum(sizes)}")
-    print(data[0])
+    # logging.debug(f"{sum(sizes)}")
+    logging.debug(data[0])
     total = 0
     langs = []
     for i in data:
@@ -505,14 +530,14 @@ def get_langs_from_data():
             if item['lang'] not in langs:
                 langs.append(item['lang'])
     store_data(data)
-    print(f"done\n {langs}")
+    logging.debug(f"done\n {langs}")
     dump('langs.pickle', langs)
     lang_dict = dict.fromkeys(langs, 0)
     # for i in data:
     #     c = Counter(i.keys())
-    #     print(c)
+    #     logging.debug(c)
     #     for k, v in groupby(i, key=itemgetter('lang')):
-    #         print(f"\t{k} -\n\t\t{v}\n")
+    #         logging.debug(f"\t{k} -\n\t\t{v}\n")
 
 
 # Scrape the books data
@@ -536,7 +561,7 @@ def clean_lang():
         i['lang'] = i.get('lang', ['?'])[0]
     c = Counter([d['lang'] for d in data])
     store_data(data)  # bad
-    print(c)
+    logging.debug(c)
 
 
 def fetch_with_proxy(url, user_agent=None):
@@ -550,7 +575,7 @@ def fetch_with_proxy(url, user_agent=None):
         session.mount("http://english.grimoar.cz", g)
 
         response = session.get(url)
-        print(response.status_code)
+        logging.debug(response.status_code)
         return response
 
 
@@ -586,5 +611,91 @@ def get_with_session(url, **kwargs):
     return session.get(url, **kwargs)
 
 
+def check_files():
+    with open("results_3de989d7-d32c-4465-827a-6e46c9ca52fa.pickle", 'rb') as f:
+        data = pickle.load(f)
+    # logging.debug(data)
+    logging.debug(f"""
+    Data : {len(data)}
+    type: {type(data)}
+    item 1 : {type(data[0])}
+  
+    """)
+    titles = {
+
+
+    }
+    for item in flatten(data):
+        t = item['title']
+        count = titles.get(t, 0)
+        count += 1
+        titles[t] = count
+
+    for k,v in titles.items():
+        logging.debug(f"Title {k} \n #number items {v}")
+    # data = [i for i in flatten(data)]
+    # logging.debug(f"""
+    #     Data : {len(data)}
+    #     type: {type(data)}
+    #     item 1 : {type(data[0])}
+    #
+    #     """)
+    # if not os.path.isfile(results):
+    #     logging.debug(f'will save to results')
+    #     store_data(data)
+
+def test_load():
+    data = [{'title':'hello'}, {'title':'world'}]
+    marked_scraped(data[0])
+    marked_scraped(data[1])
+    logging.debug("marked \n loading")
+    data2 = load(already_scraped)
+    logging.debug(data2)
+    logging.debug("-------")
+    logging.debug(check_scraped({'title':'hello'}))
+    logging.debug(check_scraped({'title':'goat'}))
+    marked_scraped({'title':'goat'})
+    data3 = load(already_scraped)
+    logging.debug(data3)
+from timeit import default_timer as timer
+
+
+def get_the_data(result_file):
+    data = load(result_file)
+    for item in flatten(data):
+        yield item
+
+def get_document_texts(result_file):
+    for item in get_the_data(result_file):
+        if not check_on_s3(item):
+            target = item['download_url']
+            doc = url_to_text(target)
+            item['document_text'] = doc
+            df = pd.DataFrame([item])
+            append_to_aws(df)
+            mark_ons3(item)
+        else:
+            logging.debug(f"Skipping {item['title']}")
+
+
+
+def test_append_s3():
+    data = [{'name':'reed'}]
+    df = pd.DataFrame(data)
+    append_to_aws(df)
+    logging.debug("load")
+    data2 = load_from_aws()
+    logging.debug(data2)
+    n = [{'name':'jo'}, {'name':'mama'}]
+    nd = pd.DataFrame(n)
+    append_to_aws(nd)
+    data3 = load_from_aws()
+    logging.debug(data3)
+
+
+
+
 if __name__ == '__main__':
-    get_everything()
+    logging.debug(f"Results will be stored in {results}")
+    # get_everything()
+    get_document_texts("results_a9fd713a-906a-43d5-9776-0f137fd2d3e2.pickle")

@@ -5,7 +5,16 @@ __pycache__/
 
 # C extensions
 *.so
+*.pickle
+*.config
+env
+*.env
+*.idea
+.idea
+*.pytest_cache
 
+*.json
+*.log
 # Distribution / packaging
 .Python
 build/
