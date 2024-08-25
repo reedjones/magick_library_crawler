@@ -5,7 +5,12 @@ __pycache__/
 
 # C extensions
 *.so
-
+*.json
+*.pickle
+*log
+*config
+*.env
+.env
 # Distribution / packaging
 .Python
 build/
