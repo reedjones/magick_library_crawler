@@ -1,0 +1,1 @@
+{"http://104.248.59.38:80": {"granted": true, "last_request_time": {"$date": "2023-07-22T13:59:09.841Z"}, "request_count": 0, "proxy": "http://104.248.59.38:80"}, "http://134.195.101.34:8080": {"last_request_time": {"$date": "2023-07-22T14:42:59.918Z"}, "request_count": 0, "host": "134.195.101.34", "port": 8080, "country": "United States"}}
